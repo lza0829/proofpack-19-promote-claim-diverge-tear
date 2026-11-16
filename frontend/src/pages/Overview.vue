@@ -12,6 +12,13 @@ onMounted(async () => {
     <h1>总览</h1>
     <p class="muted">采样抽取 → 证据打包 → 校验清单 → 放行/驳回闭环。清单全过才可放行；新规则先影子试跑，晋升后才进正式闸。</p>
     <p v-if="err" class="tag danger">{{ err }}</p>
+    <div class="panel" v-if="stats && stats.formal_track_ok === false">
+      <h3>正式轨三方未对齐 · 放行已全拒绝</h3>
+      <p class="tag danger">晋升留痕 / 正式规则表 / 包通过态不一致，须显式重做晋升或回滚后方可放行。</p>
+      <ul>
+        <li v-for="(d, i) in stats.formal_track_divergences" :key="i" class="mono">{{ d.detail }}</li>
+      </ul>
+    </div>
     <div class="panel" v-if="stats">
       <h3>主链</h3>
       <div class="stat-grid">

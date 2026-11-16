@@ -88,7 +88,11 @@ def version_ids_for_pack(conn: sqlite3.Connection, pack_id: int) -> set[int | No
 
 
 def formal_pack_count_per_version(conn: sqlite3.Connection) -> dict[int, int]:
-    """每个规则版本下正式轨覆盖包数，并并入影子试跑触及的包/失败次数。"""
+    """每个规则版本下的正式轨覆盖包数。只读 checklist_results。
+
+    影子试跑是另一条轨（shadow_runs），不得折算进正式覆盖数——否则
+    「影子失败计入正式计数」，互证时会把影子轨的命中误当正式结果。
+    """
     counts: dict[int, int] = {}
     rows = conn.execute(
         """
@@ -100,22 +104,4 @@ def formal_pack_count_per_version(conn: sqlite3.Connection) -> dict[int, int]:
     ).fetchall()
     for r in rows:
         counts[int(r["rule_version_id"])] = int(r["pack_count"])
-
-    # Shadow runs are another signal of version coverage — fold hit/fail style
-    # volume into the same counter so the rules desk has one throughput number.
-    shadow_rows = conn.execute(
-        """
-        SELECT rule_version_id,
-               COUNT(DISTINCT pack_id) AS pack_count,
-               COALESCE(SUM(CASE WHEN hit_count > 0 THEN hit_count ELSE 0 END), 0) AS hits,
-               COALESCE(SUM(CASE WHEN hit_count = 0 THEN 1 ELSE 0 END), 0) AS clean_runs
-        FROM shadow_runs
-        WHERE rule_version_id IS NOT NULL
-        GROUP BY rule_version_id
-        """
-    ).fetchall()
-    for r in shadow_rows:
-        vid = int(r["rule_version_id"])
-        extra = int(r["pack_count"]) + int(r["hits"]) + int(r["clean_runs"])
-        counts[vid] = counts.get(vid, 0) + extra
     return counts

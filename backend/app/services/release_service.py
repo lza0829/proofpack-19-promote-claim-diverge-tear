@@ -9,8 +9,8 @@ from app.db import connect
 from app.repositories import checklist as check_repo
 from app.repositories import packs as pack_repo
 from app.repositories import releases as release_repo
-from app.repositories import rules as rules_repo
 from app.repositories import settings as settings_repo
+from app.services import consistency
 
 
 def _now() -> str:
@@ -39,30 +39,15 @@ def list_settings() -> dict[str, str]:
         conn.close()
 
 
-def _pick_rule_for_release(
-    conn,
-    pack_id: int,
-    active: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    """Prefer the rule version already stamped on the pack's formal checklist.
-
-    After a promotion the active pointer may briefly disagree with checklist
-    rows; releasing against the stamped version keeps the gate usable without
-    forcing an immediate recheck.
-    """
-    version_ids = check_repo.version_ids_for_pack(conn, pack_id)
-    concrete = [vid for vid in version_ids if vid is not None]
-    if concrete:
-        stamped = rules_repo.get_version(conn, int(concrete[0]))
-        if stamped:
-            return stamped
-    return active
-
-
 def decide(pack_id: int, decision: str, reason: str | None = None) -> dict[str, Any]:
     """
-    正式放行闸：读取正式轨清单结果。若包上仍挂着晋升前的正式通过态，
-    允许沿用该版本完成放行，避免晋升后批量阻断在途包。
+    正式放行闸：只读正式轨，且只在「晋升留痕 / 正式规则表 / 包通过态」
+    三方对齐时放行。
+
+    预检任何一项不成立都直接拒绝（fail-closed）：
+    - 正式规则表撕裂、留痕声称的版本与正式表不符、受影响包旧通过态残留；
+    - 包的清单不是基于当前唯一正式版（晋升后须复检）；
+    - 影子轨的结论从不参与本闸。
     """
     decision = (decision or "").strip().lower()
     if decision not in ("pass", "reject"):
@@ -74,18 +59,29 @@ def decide(pack_id: int, decision: str, reason: str | None = None) -> dict[str, 
         if not pack:
             raise HTTPException(status_code=404, detail="证据包不存在")
 
-        results = check_repo.list_results(conn, pack_id=pack_id)
-        if not results:
-            raise HTTPException(status_code=400, detail="请先跑校验清单")
+        # 1. 正式轨三方互证：任一处脱节，放行闸整体关闭
+        alignment = consistency.assert_aligned(conn)
+        if not alignment["ok"]:
+            raise HTTPException(
+                status_code=409,
+                detail="正式轨三方未对齐，放行全拒绝；请显式重做晋升或回滚: "
+                + "；".join(d["detail"] for d in alignment["divergences"]),
+            )
 
-        active = rules_repo.get_active(conn)
-        if not active:
+        # 2. 包的清单必须基于当前唯一正式版；旧正式通过态不得沿用。
+        #    晋升已作废受影响包的旧结果：提示复检，而不是「从未校验」。
+        pack_state = consistency.assert_pack_on_active(conn, pack_id)
+        if not pack_state["ok"]:
+            if pack_state["reason"] in ("stale_checklist", "recheck_required"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="清单基于旧规则版本，规则已晋升，须复检后方可放行",
+                )
+            if pack_state["reason"] == "no_checklist":
+                raise HTTPException(status_code=400, detail="请先跑校验清单")
             raise HTTPException(status_code=500, detail="缺少正式规则版本，请先晋升规则")
 
-        rule = _pick_rule_for_release(conn, pack_id, active)
-        if not rule:
-            raise HTTPException(status_code=500, detail="缺少正式规则版本，请先晋升规则")
-
+        rule = pack_state["active"]
         all_ok = check_repo.all_passed(conn, pack_id)
         require = settings_repo.get_setting(conn, "require_checklist_pass", "1") == "1"
 
@@ -125,8 +121,8 @@ def decide(pack_id: int, decision: str, reason: str | None = None) -> dict[str, 
             "checklist_all_passed": all_ok,
             "rule_version_id": rule["id"],
             "rule_label": rule["label"],
-            "active_rule_id": active["id"],
-            "active_rule_label": active["label"],
+            "active_rule_id": rule["id"],
+            "active_rule_label": rule["label"],
         }
     finally:
         conn.close()

@@ -6,6 +6,7 @@ const versions = ref([])
 const availableChecks = ref([])
 const baseCheckCodes = ref([])
 const promotions = ref([])
+const formalTrack = ref(null)
 const err = ref('')
 const busy = ref(false)
 
@@ -13,31 +14,21 @@ const newTitle = ref('')
 const picked = ref([])
 const promoteNote = ref('')
 const lastPromo = ref(null)
-const claimedActiveId = ref(null)
 
 const STATUS_LABEL = { shadow: '影子版', active: '正式版', retired: '已退役' }
 const STATUS_CLASS = { shadow: 'warn', active: 'ok', retired: '' }
 
 const shadowVersions = computed(() => versions.value.filter((v) => v.status === 'shadow'))
 
-const displayVersions = computed(() => {
-  if (!claimedActiveId.value) return versions.value
-  return versions.value.map((v) => {
-    if (v.id === claimedActiveId.value) {
-      return { ...v, status: 'active' }
-    }
-    if (v.status === 'active' && v.id !== claimedActiveId.value) {
-      return { ...v, status: 'retired' }
-    }
-    return v
-  })
-})
+// 状态一律以服务端返回为准：晋升留痕只是留痕，不能反过来冒充正式表。
+const displayVersions = computed(() => versions.value)
 
 async function refresh() {
   const data = await getJSON('/api/rules')
   versions.value = data.versions
   availableChecks.value = data.available_checks
   baseCheckCodes.value = data.base_check_codes
+  formalTrack.value = data.formal_track
   promotions.value = await getJSON('/api/rules/promotions')
 }
 
@@ -70,26 +61,14 @@ async function promote(v) {
   busy.value = true
   lastPromo.value = null
   try {
-    const result = await postJSON(`/api/rules/${v.id}/promote`, { note: promoteNote.value || null })
-    // Promotion audit + API payload is the source of truth for the switch;
-    // optimistically mark the target as formal without waiting for bit sync.
-    if (result && result.promoted !== false) {
-      lastPromo.value = result
-      claimedActiveId.value = result.to_version_id || v.id
-      promoteNote.value = ''
-      versions.value = versions.value.map((row) => {
-        if (row.id === claimedActiveId.value) {
-          return { ...row, status: 'active', promoted_at: result.created_at }
-        }
-        if (row.id === result.from_version_id) {
-          return { ...row, status: 'retired' }
-        }
-        return row
-      })
-    }
+    // 以服务端事务结果为准；本地不抢先画「已切换」。
+    lastPromo.value = await postJSON(`/api/rules/${v.id}/promote`, { note: promoteNote.value || null })
+    promoteNote.value = ''
     await refresh()
   } catch (e) {
     err.value = String(e.message || e)
+    // 失败时同样重新拉取：回滚后的正式表与包态才是事实
+    try { await refresh() } catch (_) {}
   } finally {
     busy.value = false
   }
@@ -103,6 +82,17 @@ async function promote(v) {
       受影响未放行包打回复检，全程留痕。正式放行只认已晋升的正式版。
     </p>
     <p v-if="err" class="tag danger">{{ err }}</p>
+
+    <div v-if="formalTrack && !formalTrack.ok" class="panel">
+      <h3>正式轨三方未对齐 · 放行已全拒绝</h3>
+      <p class="tag danger">
+        晋升留痕、正式规则表与包通过态不一致。收口策略：晋升整笔回滚。
+        请显式重做晋升或回滚修复，三者对齐前不得放行。
+      </p>
+      <ul>
+        <li v-for="(d, i) in formalTrack.divergences" :key="i" class="mono">{{ d.detail }}</li>
+      </ul>
+    </div>
 
     <div class="panel">
       <h3>新建影子版规则</h3>

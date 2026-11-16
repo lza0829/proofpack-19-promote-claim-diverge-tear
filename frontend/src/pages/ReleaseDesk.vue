@@ -5,6 +5,7 @@ import { getJSON, postJSON } from '../api'
 const packs = ref([])
 const releases = ref([])
 const activeRule = ref(null)
+const formalTrack = ref(null)
 const packId = ref(null)
 const reason = ref('')
 const last = ref(null)
@@ -15,7 +16,11 @@ async function refresh() {
   packs.value = await getJSON('/api/packs')
   releases.value = await getJSON('/api/releases')
   const rules = await getJSON('/api/rules')
-  activeRule.value = rules.versions.find((v) => v.status === 'active') || null
+  formalTrack.value = rules.formal_track
+  // 只认服务端判定的唯一正式版；三方未对齐时不给「当前正式规则」背书
+  activeRule.value = rules.formal_track && rules.formal_track.ok
+    ? rules.versions.find((v) => v.id === rules.formal_track.active_version_id) || null
+    : null
   if (!packId.value && packs.value.length) packId.value = packs.value[0].id
 }
 
@@ -54,6 +59,13 @@ function decisionLabel(d) {
       （规则晋升后旧清单须复检）；影子试跑结果不参与本闸。驳回须填写原因并留痕。
     </p>
     <p v-if="err" class="tag danger">{{ err }}</p>
+    <div class="panel" v-if="formalTrack && !formalTrack.ok">
+      <h3>正式轨三方未对齐 · 放行已全拒绝</h3>
+      <p class="tag danger">晋升留痕 / 正式规则表 / 包通过态不一致，须显式重做晋升或回滚后方可放行。</p>
+      <ul>
+        <li v-for="(d, i) in formalTrack.divergences" :key="i" class="mono">{{ d.detail }}</li>
+      </ul>
+    </div>
     <div class="panel">
       <h3>做出决策</h3>
       <div class="row">

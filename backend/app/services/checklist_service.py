@@ -11,6 +11,7 @@ from app.repositories import checklist as check_repo
 from app.repositories import packs as pack_repo
 from app.repositories import rules as rules_repo
 from app.repositories import samples as sample_repo
+from app.services import consistency
 
 
 def _now() -> str:
@@ -35,6 +36,14 @@ def run_checklist(pack_id: int) -> dict[str, Any]:
         pack = pack_repo.get_pack(conn, pack_id)
         if not pack:
             raise HTTPException(status_code=404, detail="证据包不存在")
+
+        alignment = consistency.assert_aligned(conn)
+        if not alignment["ok"]:
+            raise HTTPException(
+                status_code=409,
+                detail="正式轨三方未对齐，拒绝跑正式清单；请显式重做晋升或回滚: "
+                + "；".join(d["detail"] for d in alignment["divergences"]),
+            )
 
         active = rules_repo.get_active(conn)
         if not active:

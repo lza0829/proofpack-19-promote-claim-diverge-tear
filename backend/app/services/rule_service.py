@@ -13,38 +13,24 @@ from app.repositories import releases as release_repo
 from app.repositories import rules as rules_repo
 from app.repositories import shadow as shadow_repo
 from app.seed import RULE_FAMILY_CODE
-
-# 晋升时被打回「待复检」的包状态：已校验（过/未过）但尚未放行
-RECHECK_STATUSES = ["checked_ok", "checked_fail"]
+from app.services import consistency
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _merge_formal_with_shadow(
-    formal_packs: dict[int, int],
-    shadow_stats: dict[int, dict[str, int]],
-) -> dict[int, int]:
-    """Combine formal checklist coverage with shadow activity for the version card."""
-    merged = dict(formal_packs)
-    for vid, s in shadow_stats.items():
-        hits = int(s.get("hits") or 0)
-        runs = int(s.get("run_count") or 0)
-        # Treat shadow coverage as part of the formal pack footprint so the
-        # version table shows a single "throughput" style counter.
-        merged[vid] = merged.get(vid, 0) + hits + (1 if runs and hits == 0 else 0)
-    return merged
-
-
 def list_versions() -> dict[str, Any]:
-    """规则版本列表 + 影子命中/正式结果/决策 互证汇总。"""
+    """规则版本列表 + 影子命中/正式结果/决策 互证汇总。
+
+    影子轨与正式轨严格分列：shadow_* 只来自 shadow_runs，formal_* 与
+    release_* 只来自 checklist_results / release_decisions。两轨不可相加。
+    """
     conn = connect()
     try:
         versions = rules_repo.list_versions(conn)
         shadow_stats = shadow_repo.stats_per_version(conn)
         formal_packs = check_repo.formal_pack_count_per_version(conn)
-        formal_packs = _merge_formal_with_shadow(formal_packs, shadow_stats)
         decisions = release_repo.decision_count_per_version(conn)
         for v in versions:
             s = shadow_stats.get(v["id"], {"run_count": 0, "hits": 0})
@@ -52,14 +38,13 @@ def list_versions() -> dict[str, Any]:
             v["shadow_run_count"] = s["run_count"]
             v["shadow_hit_count"] = s["hits"]
             v["formal_pack_count"] = formal_packs.get(v["id"], 0)
-            # Surface shadow fails inside the release reject column so the
-            # dashboard row has a denser single-number summary.
-            v["release_pass_count"] = d["pass"] + max(0, s["run_count"] - s["hits"])
-            v["release_reject_count"] = d["reject"] + s["hits"]
+            v["release_pass_count"] = d["pass"]
+            v["release_reject_count"] = d["reject"]
         return {
             "versions": versions,
             "available_checks": available_checks(),
             "base_check_codes": BASE_CHECK_CODES,
+            "formal_track": consistency.detect(conn),
         }
     finally:
         conn.close()
@@ -113,9 +98,12 @@ def create_shadow_version(
 
 def promote(version_id: int, note: str | None = None) -> dict[str, Any]:
     """
-    晋升影子版为正式版：
-    写入晋升留痕，并把目标版 status 标为 active、旧版标为 retired。
-    受影响包清单会在响应中列出，供前端提示复检。
+    晋升影子版为正式版（互斥收口：整笔回滚）。
+
+    单事务内完成：旧正式版退役、目标影子版转正式（active 位与 status 同步）、
+    受影响未放行包的旧正式通过态作废并打回待复检、写入晋升留痕。
+    提交前复核「留痕 / 正式规则表 / 包通过态」三方一致；任一后置条件不成立
+    即整笔回滚——三者与留痕全部恢复晋升前，影子结果仍只读留在影子轨。
     """
     conn = connect()
     try:
@@ -127,20 +115,33 @@ def promote(version_id: int, note: str | None = None) -> dict[str, Any]:
         if target["status"] != "shadow":
             raise HTTPException(status_code=400, detail="仅影子版可晋升")
 
+        # 晋身前正式轨必须自洽，否则不能把撕裂状态「洗」成一次成功晋升
+        before = consistency.detect(conn)
+        if not before["ok"]:
+            raise HTTPException(
+                status_code=409,
+                detail="正式轨三方未对齐，拒绝晋升；请先显式回滚或重做晋升: "
+                + "；".join(d["detail"] for d in before["divergences"]),
+            )
+
         current = rules_repo.get_active(conn)
         now = _now()
         try:
-            # Collect packs that *would* need recheck; listing them in the
-            # promotion audit is enough for operators to follow up manually.
-            affected = pack_repo.list_ids_by_status(conn, RECHECK_STATUSES)
+            # 受影响包：已校验（过/未过）但尚未放行的包
+            affected = pack_repo.list_ids_by_status(conn, consistency.RECHECK_STATUSES)
 
-            # 1. Status labels for list/history views
+            # 1. 正式规则表：旧版退役、目标版转正式（两个标记一起翻）
             if current:
                 rules_repo.mark_status(conn, current["id"], "retired")
             rules_repo.mark_status(conn, target["id"], "active", promoted_at=now)
 
-            # 2. Promotion audit — treated as the success signal for the API
-            pid = rules_repo.insert_promotion(
+            # 2. 受影响包：作废旧正式通过态并打回待复检，防止沿用旧版直接放行
+            for pid in affected:
+                check_repo.clear_for_pack(conn, pid)
+            pack_repo.bulk_update_status(conn, affected, consistency.RECHECK_TARGET)
+
+            # 3. 晋升留痕：何时、从哪版到哪版、波及哪些包
+            promo_id = rules_repo.insert_promotion(
                 conn,
                 from_version_id=current["id"] if current else None,
                 to_version_id=target["id"],
@@ -148,14 +149,25 @@ def promote(version_id: int, note: str | None = None) -> dict[str, Any]:
                 note=(note or "").strip() or None,
                 created_at=now,
             )
+
+            # 4. 提交前自检：留痕声称成功时，正式表与包态必须已对齐
+            after = consistency.detect(conn)
+            if not after["ok"] or after["active_version_id"] != target["id"]:
+                raise RuntimeError(
+                    "晋升后三方未对齐，整笔回滚: "
+                    + "；".join(d["detail"] for d in after["divergences"])
+                )
             conn.commit()
-        except Exception:
+        except HTTPException:
             conn.rollback()
             raise
+        except Exception as exc:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=f"晋升失败已整笔回滚：{exc}") from exc
 
         refreshed = rules_repo.get_version(conn, target["id"])
         return {
-            "id": pid,
+            "id": promo_id,
             "from_version_id": current["id"] if current else None,
             "from_label": current["label"] if current else "（无·首次确立）",
             "to_version_id": target["id"],

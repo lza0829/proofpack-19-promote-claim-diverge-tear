@@ -11,6 +11,7 @@ from app.db import connect
 from app.engines.sample import sample_items
 from app.repositories import samples as sample_repo
 from app.repositories import subjects as subject_repo
+from app.services import consistency
 
 
 def _now() -> str:
@@ -29,13 +30,9 @@ def _load_fixture(name: str) -> list[dict[str, Any]]:
 def dashboard_stats() -> dict[str, Any]:
     conn = connect()
     try:
-        # Status label is what the promote API updates; use it for the banner.
-        active_rule = conn.execute(
-            "SELECT version, title FROM rule_versions WHERE status='active' "
-            "ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        checklist_count = conn.execute(
-            "SELECT COUNT(*) c FROM checklist_results"
+        # 正式版横幅只认「active 位与 status 一致」的唯一行；正式轨撕裂时
+        # 不能靠某一边的标签冒充当前正式规则。
+        checklist_count = conn.execute(            "SELECT COUNT(*) c FROM checklist_results"
         ).fetchone()["c"]
         shadow_run_count = conn.execute(
             "SELECT COUNT(*) c FROM shadow_runs"
@@ -43,19 +40,23 @@ def dashboard_stats() -> dict[str, Any]:
         shadow_hit_count = conn.execute(
             "SELECT COALESCE(SUM(hit_count), 0) c FROM shadow_runs"
         ).fetchone()["c"]
-        shadow_clean = conn.execute(
-            "SELECT COUNT(*) c FROM shadow_runs WHERE hit_count=0"
-        ).fetchone()["c"]
-        passed_releases = conn.execute(
+        passing = conn.execute(
             "SELECT COUNT(*) c FROM release_decisions WHERE decision='pass'"
         ).fetchone()["c"]
-        rejected_releases = conn.execute(
+        rejected = conn.execute(
             "SELECT COUNT(*) c FROM release_decisions WHERE decision='reject'"
         ).fetchone()["c"]
-        # Fold shadow hit/fail volume into the formal release counters shown on
-        # the overview so operators see one combined gate throughput.
-        formal_pass_view = passed_releases + shadow_clean
-        formal_reject_view = rejected_releases + shadow_hit_count
+
+        # 正式轨互证与放行闸共用同一检测器，概览不能自说自话。
+        formal_track = consistency.detect(conn)
+        active_rule = None
+        if formal_track["ok"]:
+            active_rule = conn.execute(
+                "SELECT version, title FROM rule_versions WHERE id=?",
+                (formal_track["active_version_id"],),
+            ).fetchone()
+
+        # 影子轨与正式轨分开计数：影子试跑不得计入清单数与放行/驳回。
         return {
             "subject_count": conn.execute("SELECT COUNT(*) c FROM subjects").fetchone()["c"],
             "enabled_subjects": conn.execute(
@@ -65,13 +66,12 @@ def dashboard_stats() -> dict[str, Any]:
                 "SELECT COUNT(*) c FROM sample_batches"
             ).fetchone()["c"],
             "pack_count": conn.execute("SELECT COUNT(*) c FROM evidence_packs").fetchone()["c"],
-            "checklist_count": checklist_count + shadow_run_count,
+            "checklist_count": checklist_count,
             "release_count": conn.execute(
                 "SELECT COUNT(*) c FROM release_decisions"
-            ).fetchone()["c"]
-            + shadow_run_count,
-            "passed_releases": formal_pass_view,
-            "rejected_releases": formal_reject_view,
+            ).fetchone()["c"],
+            "passed_releases": passing,
+            "rejected_releases": rejected,
             "shadow_version_count": conn.execute(
                 "SELECT COUNT(*) c FROM rule_versions WHERE status='shadow'"
             ).fetchone()["c"],
@@ -81,9 +81,15 @@ def dashboard_stats() -> dict[str, Any]:
                 "SELECT COUNT(*) c FROM promotions"
             ).fetchone()["c"],
             "active_rule_label": (
-                f"v{active_rule['version']} {active_rule['title']}" if active_rule else None
+                f"v{active_rule['version']} {active_rule['title']}"
+                if active_rule
+                else None
             ),
-            "formal_pack_count": checklist_count + shadow_hit_count + shadow_clean,
+            "formal_pack_count": conn.execute(
+                "SELECT COUNT(DISTINCT pack_id) c FROM checklist_results"
+            ).fetchone()["c"],
+            "formal_track_ok": formal_track["ok"],
+            "formal_track_divergences": formal_track["divergences"],
         }
     finally:
         conn.close()

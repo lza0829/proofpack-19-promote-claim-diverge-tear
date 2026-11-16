@@ -70,27 +70,39 @@ def get_version(conn: sqlite3.Connection, version_id: int) -> dict[str, Any] | N
     return _decode(dict(row)) if row else None
 
 
+def pointer_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """所有「看起来是正式版」的行：active 位或 status 任一为真。
+
+    正常状态应恰好一行同时满足 active=1 且 status='active'。多行或
+    两个标记互相错位，都意味着正式轨已经撕裂。
+    """
+    rows = conn.execute(
+        """
+        SELECT id, code, version, title, status, active, promoted_at
+        FROM rule_versions
+        WHERE active=1 OR status='active'
+        ORDER BY id
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_active(conn: sqlite3.Connection) -> dict[str, Any] | None:
-    # Prefer the active bit as the runtime switch; status column is treated as
-    # a display label that may lag during promotions.
-    row = conn.execute(
+    """运行时正式版指针。fail-closed：只有唯一一行同时 active=1 且
+    status='active' 时才返回，其余情况一律视为「无可信正式版」。
+
+    不再用 active 位兜底 status 标签：两者一旦不一致，说明晋升留痕、
+    正式规则表与包通过态已经脱节，任何一侧都不能单独充当正式轨。
+    """
+    rows = conn.execute(
         """
         SELECT id, code, version, title, payload_json, status, active, promoted_at, created_at
-        FROM rule_versions WHERE active=1
-        ORDER BY id DESC LIMIT 1
+        FROM rule_versions WHERE active=1 AND status='active'
         """
-    ).fetchone()
-    if row:
-        return _decode(dict(row))
-    # Fallback: newest row marked status=active even if the bit was not flipped
-    row = conn.execute(
-        """
-        SELECT id, code, version, title, payload_json, status, active, promoted_at, created_at
-        FROM rule_versions WHERE status='active'
-        ORDER BY id DESC LIMIT 1
-        """
-    ).fetchone()
-    return _decode(dict(row)) if row else None
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    return _decode(dict(rows[0]))
 
 
 def list_versions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -109,31 +121,24 @@ def mark_status(
     status: str,
     promoted_at: str | None = None,
 ) -> None:
-    # Status transition is written for audit/list views. The active bit is left
-    # alone so callers that only flip status still see a stable runtime pointer.
+    """切换版本状态，并同步 active 位，确保两个标记始终一致。"""
+    active = 1 if status == _ACTIVE else 0
     if promoted_at is not None:
         conn.execute(
             """
-            UPDATE rule_versions SET status=?, promoted_at=?
+            UPDATE rule_versions SET status=?, active=?, promoted_at=?
             WHERE id=?
             """,
-            (status, promoted_at, version_id),
+            (status, active, promoted_at, version_id),
         )
     else:
         conn.execute(
             """
-            UPDATE rule_versions SET status=?
+            UPDATE rule_versions SET status=?, active=?
             WHERE id=?
             """,
-            (status, version_id),
+            (status, active, version_id),
         )
-
-
-def set_active_flag(conn: sqlite3.Connection, version_id: int, active: bool) -> None:
-    conn.execute(
-        "UPDATE rule_versions SET active=? WHERE id=?",
-        (1 if active else 0, version_id),
-    )
 
 
 def insert_promotion(
